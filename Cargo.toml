@@ -25,7 +25,7 @@ fuzz_constants = []
 serde = ["dep:serde"]
 
 [dependencies]
-ebr = { version = "0.2.2", path = "../ebr" }
+ebr = "0.2.2"
 stack-map = "1.0.1"
 rand = { version = "0.8.5", optional = true }
 serde = { version = "1.0.160", optional = true }

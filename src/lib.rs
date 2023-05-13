@@ -154,20 +154,19 @@ use ebr::{Ebr, Guard};
 const MERGE_SIZE: usize = 1;
 
 #[derive(Debug)]
-enum Deferred<
+enum Deferred<K, V, const FANOUT: usize>
+where
     K: 'static + Clone + Minimum + Send + Sync + Ord,
     V: 'static + Clone + Send + Sync,
-    const FANOUT: usize,
-> {
+{
     Node(Box<Node<K, V, FANOUT>>),
     BoxedAtomicPtr(BoxedAtomicPtr<K, V, FANOUT>),
 }
 
-impl<
-        K: 'static + Clone + Minimum + Send + Sync + Ord,
-        V: 'static + Clone + Send + Sync,
-        const FANOUT: usize,
-    > Drop for Deferred<K, V, FANOUT>
+impl<K, V, const FANOUT: usize> Drop for Deferred<K, V, FANOUT>
+where
+    K: 'static + Clone + Minimum + Send + Sync + Ord,
+    V: 'static + Clone + Send + Sync,
 {
     fn drop(&mut self) {
         if let Deferred::BoxedAtomicPtr(id) = self {
@@ -180,52 +179,46 @@ impl<
 }
 
 #[derive(Debug, Clone, Eq)]
-struct BoxedAtomicPtr<
+struct BoxedAtomicPtr<K, V, const FANOUT: usize>(*const AtomicPtr<Node<K, V, FANOUT>>)
+where
+    K: 'static + Clone + Minimum + Send + Sync + Ord,
+    V: 'static + Clone + Send + Sync;
+
+impl<K, V, const FANOUT: usize> Copy for BoxedAtomicPtr<K, V, FANOUT>
+where
     K: 'static + Clone + Minimum + Send + Sync + Ord,
     V: 'static + Clone + Send + Sync,
-    const FANOUT: usize,
->(*const AtomicPtr<Node<K, V, FANOUT>>);
-
-impl<
-        K: 'static + Clone + Minimum + Send + Sync + Ord,
-        V: 'static + Clone + Send + Sync,
-        const FANOUT: usize,
-    > Copy for BoxedAtomicPtr<K, V, FANOUT>
 {
 }
 
-impl<
-        K: 'static + Clone + Minimum + Send + Sync + Ord,
-        V: 'static + Clone + Send + Sync,
-        const FANOUT: usize,
-    > PartialEq for BoxedAtomicPtr<K, V, FANOUT>
+impl<K, V, const FANOUT: usize> PartialEq for BoxedAtomicPtr<K, V, FANOUT>
+where
+    K: 'static + Clone + Minimum + Send + Sync + Ord,
+    V: 'static + Clone + Send + Sync,
 {
     fn eq(&self, other: &Self) -> bool {
         self.0 == other.0
     }
 }
 
-unsafe impl<
-        K: 'static + Clone + Minimum + Send + Sync + Ord,
-        V: 'static + Clone + Send + Sync,
-        const FANOUT: usize,
-    > Send for BoxedAtomicPtr<K, V, FANOUT>
+unsafe impl<K, V, const FANOUT: usize> Send for BoxedAtomicPtr<K, V, FANOUT>
+where
+    K: 'static + Clone + Minimum + Send + Sync + Ord,
+    V: 'static + Clone + Send + Sync,
 {
 }
 
-unsafe impl<
-        K: 'static + Clone + Minimum + Send + Sync + Ord,
-        V: 'static + Clone + Send + Sync,
-        const FANOUT: usize,
-    > Sync for BoxedAtomicPtr<K, V, FANOUT>
+unsafe impl<K, V, const FANOUT: usize> Sync for BoxedAtomicPtr<K, V, FANOUT>
+where
+    K: 'static + Clone + Minimum + Send + Sync + Ord,
+    V: 'static + Clone + Send + Sync,
 {
 }
 
-impl<
-        K: 'static + Clone + Minimum + Send + Sync + Ord,
-        V: 'static + Clone + Send + Sync,
-        const FANOUT: usize,
-    > Deref for BoxedAtomicPtr<K, V, FANOUT>
+impl<K, V, const FANOUT: usize> Deref for BoxedAtomicPtr<K, V, FANOUT>
+where
+    K: 'static + Clone + Minimum + Send + Sync + Ord,
+    V: 'static + Clone + Send + Sync,
 {
     type Target = AtomicPtr<Node<K, V, FANOUT>>;
 
@@ -234,11 +227,10 @@ impl<
     }
 }
 
-impl<
-        K: 'static + Clone + Minimum + Send + Sync + Ord,
-        V: 'static + Clone + Send + Sync,
-        const FANOUT: usize,
-    > BoxedAtomicPtr<K, V, FANOUT>
+impl<K, V, const FANOUT: usize> BoxedAtomicPtr<K, V, FANOUT>
+where
+    K: 'static + Clone + Minimum + Send + Sync + Ord,
+    V: 'static + Clone + Send + Sync,
 {
     fn new(node: Box<Node<K, V, FANOUT>>) -> BoxedAtomicPtr<K, V, FANOUT> {
         let pointee_ptr = Box::into_raw(node);
@@ -368,6 +360,14 @@ pub trait Maximum: Ord {
 
 impl Minimum for () {
     const MIN: Self = ();
+}
+
+impl<T1, T2> Minimum for (T1, T2)
+where
+    T1: Minimum,
+    T2: Minimum,
+{
+    const MIN: Self = (T1::MIN, T2::MIN);
 }
 
 impl<T: Maximum> Minimum for std::cmp::Reverse<T> {
