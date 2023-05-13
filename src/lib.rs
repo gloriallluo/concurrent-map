@@ -123,17 +123,12 @@ fn debug_delay() -> bool {
     let mut rng = thread_rng();
 
     match rng.gen_range(0..100) {
-        0..=98 => {
-            //thread::yield_now();
-            false
-        }
-        _ => {
-            //thread::sleep(Duration::from_millis(1));
-            true
-        }
+        0..=98 => false,
+        _ => true,
     }
 }
 
+use crossbeam::epoch::{self, Guard, Owned};
 use stack_map::StackMap;
 
 use std::borrow::Borrow;
@@ -148,35 +143,33 @@ use std::sync::{
 #[cfg(feature = "timing")]
 use std::time::{Duration, Instant};
 
-use ebr::{Ebr, Guard};
-
 // NB this must always be 1
 const MERGE_SIZE: usize = 1;
 
-#[derive(Debug)]
-enum Deferred<K, V, const FANOUT: usize>
-where
-    K: 'static + Clone + Minimum + Send + Sync + Ord,
-    V: 'static + Clone + Send + Sync,
-{
-    Node(Box<Node<K, V, FANOUT>>),
-    BoxedAtomicPtr(BoxedAtomicPtr<K, V, FANOUT>),
-}
+// #[derive(Debug)]
+// enum Deferred<K, V, const FANOUT: usize>
+// where
+//     K: 'static + Clone + Minimum + Send + Sync + Ord,
+//     V: 'static + Clone + Send + Sync,
+// {
+//     Node(Box<Node<K, V, FANOUT>>),
+//     BoxedAtomicPtr(BoxedAtomicPtr<K, V, FANOUT>),
+// }
 
-impl<K, V, const FANOUT: usize> Drop for Deferred<K, V, FANOUT>
-where
-    K: 'static + Clone + Minimum + Send + Sync + Ord,
-    V: 'static + Clone + Send + Sync,
-{
-    fn drop(&mut self) {
-        if let Deferred::BoxedAtomicPtr(id) = self {
-            assert!(!id.0.is_null());
-            let reclaimed: Box<AtomicPtr<Node<K, V, FANOUT>>> =
-                unsafe { Box::from_raw(id.0 as *mut _) };
-            drop(reclaimed);
-        }
-    }
-}
+// impl<K, V, const FANOUT: usize> Drop for Deferred<K, V, FANOUT>
+// where
+//     K: 'static + Clone + Minimum + Send + Sync + Ord,
+//     V: 'static + Clone + Send + Sync,
+// {
+//     fn drop(&mut self) {
+//         if let Deferred::BoxedAtomicPtr(id) = self {
+//             assert!(!id.0.is_null());
+//             let reclaimed: Box<AtomicPtr<Node<K, V, FANOUT>>> =
+//                 unsafe { Box::from_raw(id.0 as *mut _) };
+//             drop(reclaimed);
+//         }
+//     }
+// }
 
 #[derive(Debug, Clone, Eq)]
 struct BoxedAtomicPtr<K, V, const FANOUT: usize>(*const AtomicPtr<Node<K, V, FANOUT>>)
@@ -240,10 +233,9 @@ where
 
     fn node_view<const LOCAL_GC_BUFFER_SIZE: usize>(
         &self,
-        _guard: &mut Guard<'_, Deferred<K, V, FANOUT>, LOCAL_GC_BUFFER_SIZE>,
+        _guard: &Guard,
     ) -> Option<NodeView<K, V, FANOUT>> {
         let ptr = NonNull::new(self.load(Ordering::Acquire))?;
-
         Some(NodeView { ptr, id: *self })
     }
 }
@@ -278,7 +270,7 @@ where
     fn cas<const LOCAL_GC_BUFFER_SIZE: usize>(
         &self,
         replacement: Box<Node<K, V, FANOUT>>,
-        guard: &mut Guard<'_, Deferred<K, V, FANOUT>, LOCAL_GC_BUFFER_SIZE>,
+        guard: &Guard,
     ) -> Result<NodeView<K, V, FANOUT>, Option<NodeView<K, V, FANOUT>>> {
         assert!(
             !(replacement.hi.is_some() ^ replacement.next.is_some()),
@@ -302,8 +294,10 @@ where
 
         match res {
             Ok(_) => {
-                let replaced: Box<Node<K, V, FANOUT>> = unsafe { Box::from_raw(self.ptr.as_ptr()) };
-                guard.defer_drop(Deferred::Node(replaced));
+                unsafe {
+                    let replaced = Owned::from_raw(self.ptr.as_ptr());
+                    guard.defer_destroy(replaced.into_shared(guard));
+                }
                 Ok(NodeView {
                     ptr: NonNull::new(replacement_ptr).unwrap(),
                     id: self.id,
@@ -481,8 +475,6 @@ where
     K: 'static + Clone + Minimum + Ord + Send + Sync,
     V: 'static + Clone + Send + Sync,
 {
-    // epoch-based reclamation
-    ebr: Ebr<Deferred<K, V, FANOUT>, LOCAL_GC_BUFFER_SIZE>,
     // the tree structure, separate from the other
     // types so that we can mix mutable references
     // to ebr with immutable references to other
@@ -560,7 +552,6 @@ where
         });
 
         ConcurrentMap {
-            ebr: Ebr::default(),
             inner,
             len: Arc::new(0.into()),
         }
@@ -589,11 +580,8 @@ where
         #[cfg(feature = "timing")]
         self.print_timing();
 
-        let ebr = Ebr::default();
-        let mut guard = ebr.pin();
-
-        let mut cursor: NodeView<K, V, FANOUT> = self.root(&mut guard);
-
+        let guard = epoch::pin();
+        let mut cursor: NodeView<K, V, FANOUT> = self.root(&guard);
         let mut lhs_chain: Vec<BoxedAtomicPtr<K, V, FANOUT>> = vec![];
 
         loop {
@@ -603,7 +591,7 @@ where
             }
             let child_ptr: BoxedAtomicPtr<K, V, FANOUT> = cursor.index().get_index(0).unwrap().1;
 
-            cursor = child_ptr.node_view(&mut guard).unwrap();
+            cursor = child_ptr.node_view::<LOCAL_GC_BUFFER_SIZE>(&guard).unwrap();
         }
 
         let mut layer = 0;
@@ -622,7 +610,7 @@ where
             let mut next_opt: Option<BoxedAtomicPtr<K, V, FANOUT>> = Some(lhs_ptr);
             while let Some(next) = next_opt {
                 assert!(!next.0.is_null());
-                let sibling_cursor = next.node_view(&mut guard).unwrap();
+                let sibling_cursor = next.node_view::<LOCAL_GC_BUFFER_SIZE>(&guard).unwrap();
 
                 let fill_phy = ((std::mem::size_of::<K>() + std::mem::size_of::<V>())
                     * sibling_cursor.len()) as f64
@@ -688,10 +676,8 @@ where
         K: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        let mut guard = self.ebr.pin();
-
-        let leaf = self.inner.leaf_for_key(LeafSearch::Eq(key), &mut guard);
-
+        let guard = epoch::pin();
+        let leaf = self.inner.leaf_for_key(LeafSearch::Eq(key), &guard);
         leaf.get(key)
     }
 
@@ -926,8 +912,8 @@ where
     /// ```
     pub fn insert(&self, key: K, value: V) -> Option<V> {
         loop {
-            let mut guard = self.ebr.pin();
-            let leaf = self.inner.leaf_for_key(LeafSearch::Eq(&key), &mut guard);
+            let guard = epoch::pin();
+            let leaf = self.inner.leaf_for_key(LeafSearch::Eq(&key), &guard);
             let mut leaf_clone: Box<Node<K, V, FANOUT>> = Box::new((*leaf).clone());
             assert!(!leaf_clone.should_split(), "bad leaf: should split",);
             let ret = leaf_clone.insert(key.clone(), value.clone());
@@ -938,7 +924,7 @@ where
                 None
             };
 
-            let install_attempt = leaf.cas(leaf_clone, &mut guard);
+            let install_attempt = leaf.cas::<LOCAL_GC_BUFFER_SIZE>(leaf_clone, &guard);
 
             if install_attempt.is_ok() {
                 if ret.is_none() {
@@ -973,11 +959,11 @@ where
         Q: Ord + ?Sized,
     {
         loop {
-            let mut guard = self.ebr.pin();
-            let leaf = self.inner.leaf_for_key(LeafSearch::Eq(key), &mut guard);
+            let guard = epoch::pin();
+            let leaf = self.inner.leaf_for_key(LeafSearch::Eq(key), &guard);
             let mut leaf_clone: Box<Node<K, V, FANOUT>> = Box::new((*leaf).clone());
             let ret = leaf_clone.remove(key);
-            let install_attempt = leaf.cas(leaf_clone, &mut guard);
+            let install_attempt = leaf.cas::<LOCAL_GC_BUFFER_SIZE>(leaf_clone, &guard);
             if install_attempt.is_ok() {
                 if ret.is_some() {
                     self.len.fetch_sub(1, Ordering::Relaxed);
@@ -1040,8 +1026,8 @@ where
         VRef: PartialEq + ?Sized,
     {
         loop {
-            let mut guard = self.ebr.pin();
-            let leaf = self.inner.leaf_for_key(LeafSearch::Eq(&key), &mut guard);
+            let guard = epoch::pin();
+            let leaf = self.inner.leaf_for_key(LeafSearch::Eq(&key), &guard);
             let mut leaf_clone: Box<Node<K, V, FANOUT>> = Box::new((*leaf).clone());
             let ret = leaf_clone.cas(key.clone(), old, new.clone());
 
@@ -1051,7 +1037,7 @@ where
                 None
             };
 
-            let install_attempt = leaf.cas(leaf_clone, &mut guard);
+            let install_attempt = leaf.cas::<LOCAL_GC_BUFFER_SIZE>(leaf_clone, &guard);
 
             if install_attempt.is_ok() {
                 if matches!(ret, Ok(Some(_))) && new.is_none() {
@@ -1100,14 +1086,13 @@ where
     /// But, you can be certain that any key that existed prior to the creation of this
     /// iterator, and was not changed during iteration, will be observed as expected.
     pub fn iter(&self) -> Iter<'_, K, V, FANOUT, LOCAL_GC_BUFFER_SIZE> {
-        let mut guard = self.ebr.pin();
+        let guard = epoch::pin();
 
-        let current = self.inner.leaf_for_key(LeafSearch::Eq(&K::MIN), &mut guard);
-        let current_back = self.inner.leaf_for_key(LeafSearch::Max, &mut guard);
+        let current = self.inner.leaf_for_key(LeafSearch::Eq(&K::MIN), &guard);
+        let current_back = self.inner.leaf_for_key(LeafSearch::Max, &guard);
         let next_index_from_back = 0;
 
         Iter {
-            guard,
             inner: &self.inner,
             current,
             range: std::ops::RangeFull,
@@ -1143,7 +1128,7 @@ where
         K: Borrow<Q>,
         Q: ?Sized + Ord + PartialEq,
     {
-        let mut guard = self.ebr.pin();
+        let guard = epoch::pin();
 
         let kmin = &K::MIN;
         let min = kmin.borrow();
@@ -1161,11 +1146,10 @@ where
             }
         };
 
-        let current = self.inner.leaf_for_key(LeafSearch::Eq(start), &mut guard);
-        let current_back = self.inner.leaf_for_key(end, &mut guard);
+        let current = self.inner.leaf_for_key(LeafSearch::Eq(start), &guard);
+        let current_back = self.inner.leaf_for_key(end, &guard);
 
         Iter {
-            guard,
             inner: &self.inner,
             range,
             current,
@@ -1196,7 +1180,7 @@ where
 /// So, if an `Iter` is created from:
 ///
 /// ```
-/// let map = concurrent_map::ConcurrentMap::default::<usize, usize>();
+/// let map = concurrent_map::ConcurrentMap::<usize, usize, 8, 256>::default();
 /// let start = std::ops::Bound::Excluded(0_usize);
 /// let end = std::ops::Bound::Included(5_usize);
 /// let iter = map.range((start, end));
@@ -1220,7 +1204,6 @@ pub struct Iter<
     Q: ?Sized,
 {
     inner: &'a Inner<K, V, FANOUT, LOCAL_GC_BUFFER_SIZE>,
-    guard: Guard<'a, Deferred<K, V, FANOUT>, LOCAL_GC_BUFFER_SIZE>,
     range: R,
     current: NodeView<K, V, FANOUT>,
     next_index: usize,
@@ -1258,7 +1241,8 @@ where
                     // we have reached the end of our range
                     return None;
                 }
-                if let Some(next_current) = next_ptr.node_view(&mut self.guard) {
+                let guard = epoch::pin();
+                if let Some(next_current) = next_ptr.node_view::<LOCAL_GC_BUFFER_SIZE>(&guard) {
                     // we were able to take the fast path by following the sibling pointer
 
                     // it's possible that nodes were merged etc... so we need to make sure
@@ -1276,9 +1260,8 @@ where
                     // right sibling. we are protected from a use after
                     // free of the ID itself due to holding an ebr Guard
                     // on the Iter struct, holding a barrier against re-use.
-                    let next_current = self
-                        .inner
-                        .leaf_for_key(LeafSearch::Eq(hi.borrow()), &mut self.guard);
+                    let guard = epoch::pin();
+                    let next_current = self.inner.leaf_for_key(LeafSearch::Eq(hi.borrow()), &guard);
 
                     // it's possible that nodes were merged etc... so we need to make sure
                     // that we make forward progress
@@ -1318,10 +1301,10 @@ where
                     return None;
                 }
 
-                let next_current_back = self.inner.leaf_for_key(
-                    LeafSearch::Lt(self.current_back.lo.borrow()),
-                    &mut self.guard,
-                );
+                let guard = epoch::pin();
+                let next_current_back = self
+                    .inner
+                    .leaf_for_key(LeafSearch::Lt(self.current_back.lo.borrow()), &guard);
                 assert!(next_current_back.lo != self.current_back.lo);
 
                 self.next_index_from_back = next_current_back
@@ -1371,10 +1354,7 @@ where
     K: 'static + Clone + Minimum + Ord + Send + Sync,
     V: 'static + Clone + Send + Sync,
 {
-    fn root(
-        &self,
-        _guard: &mut Guard<'_, Deferred<K, V, FANOUT>, LOCAL_GC_BUFFER_SIZE>,
-    ) -> NodeView<K, V, FANOUT> {
+    fn root(&self, _guard: &Guard) -> NodeView<K, V, FANOUT> {
         loop {
             if let Some(ptr) = NonNull::new(self.root.load(Ordering::Acquire)) {
                 return NodeView { ptr, id: self.root };
@@ -1404,7 +1384,7 @@ where
         &'a self,
         parent: &NodeView<K, V, FANOUT>,
         child: &NodeView<K, V, FANOUT>,
-        guard: &mut Guard<'a, Deferred<K, V, FANOUT>, LOCAL_GC_BUFFER_SIZE>,
+        guard: &Guard,
     ) -> Result<NodeView<K, V, FANOUT>, ()> {
         // 1. try to mark the parent's merging_child
         //  a. must not be the left-most child
@@ -1427,20 +1407,22 @@ where
 
         let mut parent_clone: Box<Node<K, V, FANOUT>> = Box::new((*parent).clone());
         parent_clone.merging_child = Some(child.id);
-        parent.cas(parent_clone, guard).map_err(|_| ())
+        parent
+            .cas::<LOCAL_GC_BUFFER_SIZE>(parent_clone, guard)
+            .map_err(|_| ())
     }
 
     fn merge_child<'a>(
         &'a self,
         parent: &mut NodeView<K, V, FANOUT>,
         child: &mut NodeView<K, V, FANOUT>,
-        guard: &mut Guard<'a, Deferred<K, V, FANOUT>, LOCAL_GC_BUFFER_SIZE>,
+        guard: &Guard,
     ) {
         // 2. mark child as merging
         while !child.is_merging {
             let mut child_clone: Box<Node<K, V, FANOUT>> = Box::new((*child).clone());
             child_clone.is_merging = true;
-            *child = match child.cas(child_clone, guard) {
+            *child = match child.cas::<LOCAL_GC_BUFFER_SIZE>(child_clone, guard) {
                 Ok(new_child) | Err(Some(new_child)) => new_child,
                 Err(None) => {
                     // child already removed
@@ -1458,12 +1440,13 @@ where
             .unwrap()
             .1;
 
-        let mut left_sibling = if let Some(view) = first_left_sibling_guess.node_view(guard) {
-            view
-        } else {
-            // the merge already completed and this left sibling has already also been merged
-            return;
-        };
+        let mut left_sibling =
+            if let Some(view) = first_left_sibling_guess.node_view::<LOCAL_GC_BUFFER_SIZE>(guard) {
+                view
+            } else {
+                // the merge already completed and this left sibling has already also been merged
+                return;
+            };
 
         loop {
             if left_sibling.next.is_none() {
@@ -1479,7 +1462,7 @@ where
 
             let next = left_sibling.next.unwrap();
             if next != child.id {
-                left_sibling = if let Some(view) = next.node_view(guard) {
+                left_sibling = if let Some(view) = next.node_view::<LOCAL_GC_BUFFER_SIZE>(guard) {
                     view
                 } else {
                     // the merge already completed and this left sibling has already also been merged
@@ -1499,13 +1482,12 @@ where
                 // we have to try to split the sibling, funny enough.
                 // this is the consequence of using fixed-size arrays
                 // for storing items with no flexibility.
-
                 Some(left_sibling_clone.split())
             } else {
                 None
             };
 
-            let cas_result = left_sibling.cas(left_sibling_clone, guard);
+            let cas_result = left_sibling.cas::<LOCAL_GC_BUFFER_SIZE>(left_sibling_clone, guard);
             if let (Err(_), Some(rhs_ptr)) = (&cas_result, rhs_ptr_opt) {
                 // We need to free the split right sibling that we installed
                 let reclaimed_ptr: Box<AtomicPtr<Node<K, V, FANOUT>>> =
@@ -1536,7 +1518,7 @@ where
             parent_clone.merging_child = None;
             parent_clone.index_mut().remove(&child.lo).unwrap();
 
-            let cas_result = parent.cas(parent_clone, guard);
+            let cas_result = parent.cas::<LOCAL_GC_BUFFER_SIZE>(parent_clone, guard);
             match cas_result {
                 Ok(new_parent) | Err(Some(new_parent)) => *parent = new_parent,
                 Err(None) => {
@@ -1562,11 +1544,17 @@ where
         }
 
         // 7. defer the reclamation of the BoxedAtomicPtr
-        guard.defer_drop(Deferred::BoxedAtomicPtr(child.id));
+        unsafe {
+            let reclaimed: Owned<AtomicPtr<Node<K, V, FANOUT>>> =
+                Owned::from_raw(child.id.0 as *mut _); // XXX
+            guard.defer_destroy(reclaimed.into_shared(guard));
+        }
 
         // 8. defer the reclamation of the child node
-        let replaced: Box<Node<K, V, FANOUT>> = unsafe { Box::from_raw(child.ptr.as_ptr()) };
-        guard.defer_drop(Deferred::Node(replaced));
+        unsafe {
+            let replaced = Owned::from_raw(child.ptr.as_ptr());
+            guard.defer_destroy(replaced.into_shared(guard));
+        }
     }
 
     #[cfg(feature = "timing")]
@@ -1598,7 +1586,7 @@ where
     fn leaf_for_key<'a, Q>(
         &'a self,
         search: LeafSearch<&Q>,
-        guard: &mut Guard<'a, Deferred<K, V, FANOUT>, LOCAL_GC_BUFFER_SIZE>,
+        guard: &Guard,
     ) -> NodeView<K, V, FANOUT>
     where
         K: Borrow<Q>,
@@ -1629,7 +1617,9 @@ where
 
         loop {
             if let Some(merging_child_ptr) = cursor.merging_child {
-                let mut child = if let Some(view) = merging_child_ptr.node_view(guard) {
+                let mut child = if let Some(view) =
+                    merging_child_ptr.node_view::<LOCAL_GC_BUFFER_SIZE>(guard)
+                {
                     view
                 } else {
                     reset!("merging child of marked parent already freed");
@@ -1679,7 +1669,7 @@ where
                 if go_right {
                     // go right to the tree sibling
                     let next = cursor.next.unwrap();
-                    let rhs = if let Some(view) = next.node_view(guard) {
+                    let rhs = if let Some(view) = next.node_view::<LOCAL_GC_BUFFER_SIZE>(guard) {
                         view
                     } else {
                         reset!("right child already freed");
@@ -1698,7 +1688,9 @@ where
                                 None
                             };
 
-                            if let Ok(new_parent_view) = parent_cursor.cas(parent_clone, guard) {
+                            if let Ok(new_parent_view) =
+                                parent_cursor.cas::<LOCAL_GC_BUFFER_SIZE>(parent_clone, guard)
+                            {
                                 parent_cursor_opt = Some(new_parent_view);
                             } else if let Some(rhs_ptr) = rhs_ptr_opt {
                                 let reclaimed_ptr: Box<AtomicPtr<Node<K, V, FANOUT>>> =
@@ -1787,7 +1779,7 @@ where
             };
 
             parent_cursor_opt = Some(cursor);
-            cursor = if let Some(view) = child_ptr.node_view(guard) {
+            cursor = if let Some(view) = child_ptr.node_view::<LOCAL_GC_BUFFER_SIZE>(guard) {
                 view
             } else {
                 reset!("attempt to traverse to child failed because the child has been freed");
